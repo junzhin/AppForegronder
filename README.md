@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="AppForegronder/AppIcon.icns" width="128" height="128" alt="AppForegronder Icon">
+  <img src="assets/icon.png" width="128" height="128" alt="AppForegronder Icon">
 </p>
 
 <h1 align="center">AppForegronder</h1>
