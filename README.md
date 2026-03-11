@@ -17,6 +17,10 @@
 
 ---
 
+<p align="center">
+  <img src="assets/screenshot.png" width="400" alt="AppForegronder Screenshot">
+</p>
+
 ## Features
 
 | Feature | Description |
