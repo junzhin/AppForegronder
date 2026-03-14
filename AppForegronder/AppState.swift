@@ -2,6 +2,14 @@ import Foundation
 import Combine
 import ServiceManagement
 
+struct LogEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let appName: String
+    let trigger: String
+    let success: Bool
+}
+
 class AppState: ObservableObject {
 
     struct AppInfo: Identifiable, Hashable {
@@ -14,8 +22,8 @@ class AppState: ObservableObject {
 
     @Published var runningApps: [AppInfo] = []
 
-    @Published var selectedBundleID: String? {
-        didSet { UserDefaults.standard.set(selectedBundleID, forKey: Keys.selectedBundleID) }
+    @Published var selectedBundleIDs: [String] {
+        didSet { UserDefaults.standard.set(selectedBundleIDs, forKey: Keys.selectedBundleIDs) }
     }
 
     @Published var unlockEnabled: Bool {
@@ -34,12 +42,12 @@ class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(smartUnlockEnabled, forKey: Keys.smartUnlockEnabled) }
     }
 
-    @Published var lockThresholdHours: Double {
-        didSet { UserDefaults.standard.set(lockThresholdHours, forKey: Keys.lockThresholdHours) }
+    @Published var lockThresholdMinutes: Double {
+        didSet { UserDefaults.standard.set(lockThresholdMinutes, forKey: Keys.lockThresholdMinutes) }
     }
 
-    @Published var repeatCount: Int {
-        didSet { UserDefaults.standard.set(repeatCount, forKey: Keys.repeatCount) }
+    @Published var hotkeyEnabled: Bool {
+        didSet { UserDefaults.standard.set(hotkeyEnabled, forKey: Keys.hotkeyEnabled) }
     }
 
     @Published var launchAtLogin: Bool = false {
@@ -53,35 +61,39 @@ class AppState: ObservableObject {
     var l10n: L10n { L10n(lang: language) }
 
     @Published var isActive: Bool = false
+    @Published var accessibilityGranted: Bool = false
+    @Published var recentLogs: [LogEntry] = []
 
     // MARK: - Private
 
     private enum Keys {
-        static let selectedBundleID   = "selectedBundleID"
-        static let unlockEnabled      = "unlockEnabled"
-        static let timerEnabled       = "timerEnabled"
-        static let timerInterval      = "timerInterval"
-        static let smartUnlockEnabled = "smartUnlockEnabled"
-        static let lockThresholdHours = "lockThresholdHours"
-        static let repeatCount        = "repeatCount"
-        static let language           = "language"
+        static let selectedBundleIDs    = "selectedBundleIDs"
+        static let unlockEnabled        = "unlockEnabled"
+        static let timerEnabled         = "timerEnabled"
+        static let timerInterval        = "timerInterval"
+        static let smartUnlockEnabled   = "smartUnlockEnabled"
+        static let lockThresholdMinutes = "lockThresholdMinutes"
+        static let hotkeyEnabled        = "hotkeyEnabled"
+        static let language             = "language"
     }
 
     private let activator = AppActivator()
     private var lockObserver: ScreenLockObserver?
     private var timerManager: TimerManager?
+    private var hotkeyManager: HotkeyManager?
+    private let maxLogCount = 50
 
     // MARK: - Init
 
     init() {
         let defaults = UserDefaults.standard
-        self.selectedBundleID   = defaults.string(forKey: Keys.selectedBundleID)
-        self.unlockEnabled      = defaults.object(forKey: Keys.unlockEnabled) as? Bool ?? false
-        self.timerEnabled       = defaults.object(forKey: Keys.timerEnabled)  as? Bool ?? false
-        self.timerInterval      = defaults.object(forKey: Keys.timerInterval) as? Double ?? 5.0
-        self.smartUnlockEnabled = defaults.object(forKey: Keys.smartUnlockEnabled) as? Bool ?? false
-        self.lockThresholdHours = defaults.object(forKey: Keys.lockThresholdHours) as? Double ?? 1.0
-        self.repeatCount        = defaults.object(forKey: Keys.repeatCount) as? Int ?? 5
+        self.selectedBundleIDs    = defaults.object(forKey: Keys.selectedBundleIDs) as? [String] ?? []
+        self.unlockEnabled        = defaults.object(forKey: Keys.unlockEnabled) as? Bool ?? false
+        self.timerEnabled         = defaults.object(forKey: Keys.timerEnabled)  as? Bool ?? false
+        self.timerInterval        = defaults.object(forKey: Keys.timerInterval) as? Double ?? 5.0
+        self.smartUnlockEnabled   = defaults.object(forKey: Keys.smartUnlockEnabled) as? Bool ?? false
+        self.lockThresholdMinutes = defaults.object(forKey: Keys.lockThresholdMinutes) as? Double ?? 30.0
+        self.hotkeyEnabled        = defaults.object(forKey: Keys.hotkeyEnabled) as? Bool ?? false
 
         if let langStr = defaults.string(forKey: Keys.language),
            let lang = Language(rawValue: langStr) {
@@ -92,6 +104,7 @@ class AppState: ObservableObject {
             self.launchAtLogin = (SMAppService.mainApp.status == .enabled)
         }
 
+        self.accessibilityGranted = AccessibilityChecker.isTrusted
         refreshRunningApps()
     }
 
@@ -102,20 +115,30 @@ class AppState: ObservableObject {
         runningApps = raw.map { AppInfo(name: $0.name, bundleID: $0.bundleID) }
     }
 
+    func toggleApp(_ bundleID: String) {
+        if let idx = selectedBundleIDs.firstIndex(of: bundleID) {
+            selectedBundleIDs.remove(at: idx)
+        } else {
+            selectedBundleIDs.append(bundleID)
+        }
+    }
+
     func start() {
         guard !isActive else { return }
+
+        accessibilityGranted = AccessibilityChecker.isTrusted
 
         if unlockEnabled {
             let observer = ScreenLockObserver()
             observer.onUnlock = { [weak self] lockDuration in
                 guard let self = self else { return }
                 if self.smartUnlockEnabled {
-                    let thresholdSeconds = self.lockThresholdHours * 3600
+                    let thresholdSeconds = self.lockThresholdMinutes * 60
                     if lockDuration >= thresholdSeconds {
-                        self.repeatBringToFront()
+                        self.bringToFront(trigger: "unlock")
                     }
                 } else {
-                    self.bringToFront()
+                    self.bringToFront(trigger: "unlock")
                 }
             }
             observer.start()
@@ -125,9 +148,18 @@ class AppState: ObservableObject {
         if timerEnabled {
             let manager = TimerManager()
             manager.start(intervalMinutes: timerInterval) { [weak self] in
-                self?.bringToFront()
+                self?.bringToFront(trigger: "timer")
             }
             timerManager = manager
+        }
+
+        if hotkeyEnabled {
+            let hk = HotkeyManager()
+            hk.onTrigger = { [weak self] in
+                self?.bringToFront(trigger: "hotkey")
+            }
+            hk.start()
+            hotkeyManager = hk
         }
 
         isActive = true
@@ -138,12 +170,23 @@ class AppState: ObservableObject {
         lockObserver = nil
         timerManager?.stop()
         timerManager = nil
+        hotkeyManager?.stop()
+        hotkeyManager = nil
         isActive = false
     }
 
-    func bringToFront() {
-        guard let bundleID = selectedBundleID else { return }
-        activator.activate(bundleID: bundleID)
+    func bringToFront(trigger: String = "manual") {
+        for bundleID in selectedBundleIDs {
+            let success = activator.activate(bundleID: bundleID)
+            let appName = runningApps.first { $0.bundleID == bundleID }?.name ?? bundleID
+            let entry = LogEntry(timestamp: Date(), appName: appName, trigger: trigger, success: success)
+            recentLogs.insert(entry, at: 0)
+            if recentLogs.count > maxLogCount { recentLogs.removeLast() }
+        }
+    }
+
+    func checkAccessibility() {
+        accessibilityGranted = AccessibilityChecker.isTrusted
     }
 
     // MARK: - Launch At Login
@@ -158,17 +201,6 @@ class AppState: ObservableObject {
                 }
             } catch {
                 NSLog("LaunchAtLogin error: %@", error.localizedDescription)
-            }
-        }
-    }
-
-    // MARK: - Private Methods
-
-    private func repeatBringToFront() {
-        let count = repeatCount
-        for i in 0..<count {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 2.0) { [weak self] in
-                self?.bringToFront()
             }
         }
     }

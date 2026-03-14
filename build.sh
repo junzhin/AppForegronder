@@ -31,6 +31,17 @@ cat > "${APP_BUNDLE}/Contents/PkgInfo" << 'EOF'
 APPL????
 EOF
 
+echo "=== Signing ==="
+if [ -n "${SIGNING_IDENTITY:-}" ]; then
+    codesign --force --sign "${SIGNING_IDENTITY}" \
+        --entitlements AppForegronder/AppForegronder.entitlements \
+        --options runtime \
+        "${APP_BUNDLE}"
+    echo "Signed with ${SIGNING_IDENTITY}"
+else
+    echo "Skipped (set SIGNING_IDENTITY to sign)"
+fi
+
 echo "=== Done ==="
 echo "App bundle: ${APP_BUNDLE}"
 echo ""
